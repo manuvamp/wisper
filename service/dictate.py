@@ -167,58 +167,152 @@ def disable_filter_keys_shortcut():
 
 
 # ---------------------------------------------------------------- floating pill (never takes focus)
+LRESULT, WPARAM, LPARAM = ctypes.c_ssize_t, ctypes.c_size_t, ctypes.c_ssize_t
+WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wt.HWND, wt.UINT, WPARAM, LPARAM)
+
+
+class WNDCLASSEXW(ctypes.Structure):
+    _fields_ = [("cbSize", wt.UINT), ("style", wt.UINT), ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int), ("hInstance", wt.HINSTANCE), ("hIcon", wt.HICON),
+                ("hCursor", wt.HANDLE), ("hbrBackground", wt.HBRUSH), ("lpszMenuName", wt.LPCWSTR),
+                ("lpszClassName", wt.LPCWSTR), ("hIconSm", wt.HICON)]
+
+
+class PAINTSTRUCT(ctypes.Structure):
+    _fields_ = [("hdc", wt.HDC), ("fErase", wt.BOOL), ("rcPaint", wt.RECT), ("fRestore", wt.BOOL),
+                ("fIncUpdate", wt.BOOL), ("rgbReserved", ctypes.c_byte * 32)]
+
+
+gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+user32.DefWindowProcW.argtypes = (wt.HWND, wt.UINT, WPARAM, LPARAM)
+user32.DefWindowProcW.restype = LRESULT
+user32.CreateWindowExW.restype = wt.HWND
+user32.CreateWindowExW.argtypes = (wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, wt.HWND, wt.HMENU, wt.HINSTANCE, wt.LPVOID)
+user32.BeginPaint.restype = wt.HDC
+user32.BeginPaint.argtypes = (wt.HWND, ctypes.POINTER(PAINTSTRUCT))
+user32.EndPaint.argtypes = (wt.HWND, ctypes.POINTER(PAINTSTRUCT))
+user32.PostMessageW.argtypes = (wt.HWND, wt.UINT, WPARAM, LPARAM)
+user32.ShowWindow.argtypes = (wt.HWND, ctypes.c_int)
+user32.SetWindowPos.argtypes = (wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.UINT)
+user32.InvalidateRect.argtypes = (wt.HWND, wt.LPVOID, wt.BOOL)
+user32.SetLayeredWindowAttributes.argtypes = (wt.HWND, wt.DWORD, ctypes.c_ubyte, wt.DWORD)
+user32.FillRect.argtypes = (wt.HDC, ctypes.POINTER(wt.RECT), wt.HBRUSH)
+gdi32.CreateFontW.restype = wt.HFONT
+gdi32.SelectObject.restype = wt.HGDIOBJ
+gdi32.SelectObject.argtypes = (wt.HDC, wt.HGDIOBJ)
+gdi32.CreateSolidBrush.restype = wt.HBRUSH
+gdi32.SetTextColor.argtypes = gdi32.SetBkColor.argtypes = (wt.HDC, wt.DWORD)
+gdi32.TextOutW.argtypes = (wt.HDC, ctypes.c_int, ctypes.c_int, wt.LPCWSTR, ctypes.c_int)
+gdi32.GetTextExtentPoint32W.argtypes = (wt.HDC, wt.LPCWSTR, ctypes.c_int, ctypes.POINTER(wt.SIZE))
+gdi32.DeleteObject.argtypes = (wt.HGDIOBJ,)
+gdi32.GetStockObject.restype = wt.HGDIOBJ
+gdi32.Ellipse.argtypes = (wt.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int)
+user32.GetClientRect.argtypes = (wt.HWND, ctypes.POINTER(wt.RECT))
+kernel32.GetModuleHandleW.restype = wt.HMODULE
+user32.GetDC.restype = wt.HDC
+user32.GetDC.argtypes = (wt.HWND,)
+user32.ReleaseDC.argtypes = (wt.HWND, wt.HDC)
+
+
+def _rgb(hex_color):
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    return r | (g << 8) | (b << 16)
+
+
 class Pill:
+    """Small "Listening" / "Transcribing" badge at the bottom of the screen. A plain Win32 window created with
+    WS_EX_NOACTIVATE from the start: it can never take the keyboard focus (the earlier Tk window grabbed the foreground
+    once at service start, so whatever you were typing in lost its cursor)."""
+    WM_APP_UPDATE = 0x8001
+    BG, FG = "#18181b", "#f4f4f5"
+
     def __init__(self):
-        self.q = queue.Queue()
+        self.state = None           # (text, color) or None = hidden
+        self.hwnd = None
+        self.ready = threading.Event()
         threading.Thread(target=self._run, daemon=True, name="pill").start()
+        self.ready.wait(5)
 
     def show(self, text, color):
-        self.q.put((text, color))
+        self.state = (text, color)
+        self._post()
 
     def hide(self):
-        self.q.put(None)
+        self.state = None
+        self._post()
+
+    def _post(self):
+        if self.hwnd:
+            user32.PostMessageW(self.hwnd, self.WM_APP_UPDATE, 0, 0)
+
+    def _layout(self, text):
+        hdc = user32.GetDC(self.hwnd)
+        old = gdi32.SelectObject(hdc, self.font)
+        size = wt.SIZE()
+        gdi32.GetTextExtentPoint32W(hdc, text, len(text), ctypes.byref(size))
+        gdi32.SelectObject(hdc, old)
+        user32.ReleaseDC(self.hwnd, hdc)
+        h = size.cy + 14
+        return 12 + 10 + 8 + size.cx + 16, h
+
+    def _proc(self, hwnd, msg, wparam, lparam):
+        if msg == self.WM_APP_UPDATE:
+            st = self.state
+            if st is None:
+                user32.ShowWindow(hwnd, 0)                                   # SW_HIDE
+            else:
+                w, h = self._layout(st[0])
+                sw, sh = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+                SWP_NOACTIVATE, SWP_SHOWWINDOW = 0x10, 0x40
+                user32.SetWindowPos(hwnd, wt.HWND(-1), (sw - w) // 2, sh - h - 90, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW)
+                user32.InvalidateRect(hwnd, None, True)
+            return 0
+        if msg == 0x000F:                                                    # WM_PAINT
+            ps = PAINTSTRUCT()
+            hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
+            st = self.state or ("", self.FG)
+            rc = wt.RECT()
+            user32.GetClientRect(hwnd, ctypes.byref(rc))
+            user32.FillRect(hdc, ctypes.byref(rc), self.bg_brush)
+            old = gdi32.SelectObject(hdc, self.font)
+            gdi32.SetBkColor(hdc, _rgb(self.BG))
+            dot = gdi32.CreateSolidBrush(_rgb(st[1]))
+            old_brush = gdi32.SelectObject(hdc, dot)
+            null_pen = gdi32.SelectObject(hdc, gdi32.GetStockObject(8))      # NULL_PEN
+            cy = (rc.bottom - rc.top) // 2
+            gdi32.Ellipse(hdc, 12, cy - 5, 22, cy + 5)
+            gdi32.SelectObject(hdc, null_pen)
+            gdi32.SelectObject(hdc, old_brush)
+            gdi32.DeleteObject(dot)
+            gdi32.SetTextColor(hdc, _rgb(self.FG))
+            size = wt.SIZE()
+            gdi32.GetTextExtentPoint32W(hdc, st[0], len(st[0]), ctypes.byref(size))
+            gdi32.TextOutW(hdc, 30, cy - size.cy // 2, st[0], len(st[0]))
+            gdi32.SelectObject(hdc, old)
+            user32.EndPaint(hwnd, ctypes.byref(ps))
+            return 0
+        if msg == 0x0021:                                                    # WM_MOUSEACTIVATE
+            return 3                                                         # MA_NOACTIVATE
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     def _run(self):
-        import tkinter as tk
-        root = tk.Tk()
-        root.overrideredirect(True)
-        root.attributes("-topmost", True, "-alpha", 0.92)
-        root.configure(bg="#18181b")
-        dot = tk.Label(root, text="●", fg="#ef4444", bg="#18181b", font=("Segoe UI", 11))
-        lbl = tk.Label(root, text="", fg="#f4f4f5", bg="#18181b", font=("Segoe UI", 10))
-        dot.pack(side="left", padx=(12, 4), pady=6)
-        lbl.pack(side="left", padx=(0, 14), pady=6)
-        root.withdraw()
-        root.update_idletasks()
-        hwnd = user32.GetParent(root.winfo_id()) or root.winfo_id()
-        GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT = -20, 0x08000000, 0x80, 0x20
-        user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
-                              user32.GetWindowLongW(hwnd, GWL_EXSTYLE) | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
-                              | WS_EX_TRANSPARENT)
-        SW_SHOWNOACTIVATE, SW_HIDE = 4, 0
-
-        def poll():
-            try:
-                while True:
-                    item = self.q.get_nowait()
-                    if item is None:
-                        user32.ShowWindow(hwnd, SW_HIDE)
-                        continue
-                    text, color = item
-                    lbl.config(text=text)
-                    dot.config(fg=color)
-                    root.update_idletasks()
-                    w, h = root.winfo_reqwidth(), root.winfo_reqheight()
-                    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-                    root.geometry(f"{w}x{h}+{(sw - w) // 2}+{sh - h - 90}")
-                    user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
-                    user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x1 | 0x2 | 0x10)  # topmost, no move/size/activate
-            except queue.Empty:
-                pass
-            root.after(30, poll)
-
-        poll()
-        root.mainloop()
+        hinst = kernel32.GetModuleHandleW(None)
+        self._wndproc = WNDPROC(self._proc)                                  # keep a reference
+        wc = WNDCLASSEXW(cbSize=ctypes.sizeof(WNDCLASSEXW), lpfnWndProc=self._wndproc, hInstance=hinst,
+                         lpszClassName="wisper-pill")
+        user32.RegisterClassExW(ctypes.byref(wc))
+        self.font = gdi32.CreateFontW(-13, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI")   # CLEARTYPE_QUALITY
+        self.bg_brush = gdi32.CreateSolidBrush(_rgb(self.BG))
+        WS_EX = 0x08000000 | 0x80 | 0x20 | 0x8 | 0x80000   # NOACTIVATE | TOOLWINDOW | TRANSPARENT | TOPMOST | LAYERED
+        self.hwnd = user32.CreateWindowExW(WS_EX, "wisper-pill", "wisper", 0x80000000,  # WS_POPUP, not visible
+                                           0, 0, 10, 10, None, None, hinst, None)
+        user32.SetLayeredWindowAttributes(self.hwnd, 0, 235, 0x2)            # LWA_ALPHA
+        self.ready.set()
+        msg = wt.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
 
 
 # ---------------------------------------------------------------- microphone (open while active)

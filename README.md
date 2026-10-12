@@ -89,6 +89,9 @@ Memory: one process, ~0.6 GB RAM and ~2.6 GB of GPU memory.
 ## Text always lands
 - Holding Shift for ~8 s triggers Windows' Filter Keys shortcut, whose pop-up steals the keyboard focus. wisper turns
   that shortcut off at start (`"fix_filter_keys_shortcut": false` to leave it alone); Filter Keys itself is untouched.
+- The Listening/Transcribing pill is a plain Win32 window created with `WS_EX_NOACTIVATE`, so it can never take the
+  focus. (It used to be a Tk window, which grabbed the foreground once each time the service started; found with
+  `tools/focus_watch.py`.)
 - The window you pressed the hotkey in is remembered. If something else took the focus by the time the text is
   ready, wisper gives it back; if it can't, the text goes to the clipboard and the pill says "Copied - press Ctrl+V".
   Either case is logged ("focus moved during dictation: ...").
