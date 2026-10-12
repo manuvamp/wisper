@@ -1,0 +1,9 @@
+{
+ "_doc": "Copy to replacements.json. [what Whisper writes, what you meant, note]. Matched as whole words, case-insensitive, longest first. The nightly learner appends pairs it has seen repeatedly.",
+ "pairs": [
+  ["chat gpt", "ChatGPT", "seed"],
+  ["on linked in", "on LinkedIn", "seed"],
+  ["i os", "iOS", "seed"],
+  ["git hub", "GitHub", "seed"]
+ ]
+}

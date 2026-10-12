@@ -1,0 +1,17 @@
+# personal data: dictations, recordings, logs, your words
+data/
+logs/
+personal/*.json
+!personal/*.example.json
+config.local.json
+
+# test recordings and results (your voice and transcripts)
+lab/clips/
+lab/*.json
+lab/*.out
+
+# NVIDIA DLLs (download, see README)
+bin/
+
+__pycache__/
+*.pyc
