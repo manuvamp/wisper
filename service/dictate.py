@@ -70,11 +70,17 @@ class INPUT(ctypes.Structure):
 KEYEVENTF_UNICODE, KEYEVENTF_KEYUP = 0x4, 0x2
 
 
-def type_text(text):
+def type_text(text, target=None):
+    """Type into `target` (the window you pressed the hotkey in). Returns False if it can't be reached."""
     # wait (max 1.5 s) until Ctrl/Shift are physically released so nothing turns into a shortcut
     t_end = time.time() + 1.5
     while time.time() < t_end and any(user32.GetAsyncKeyState(vk) & 0x8000 for vk in (0x10, 0x11, 0x12)):
         time.sleep(0.01)
+    fg = user32.GetForegroundWindow()
+    if target and fg != target:
+        log.info("focus moved during dictation: %r -> %r", window_title(target)[:60], window_title(fg)[:60])
+        if not refocus(target):
+            return False
     events = []
     data =text.replace("\r", "").replace("\n", " ").encode("utf-16-le")
     for i in range(0, len(data), 2):
@@ -83,6 +89,81 @@ def type_text(text):
             events.append(INPUT(type=1, ki=KEYBDINPUT(0, code, flags, 0, 0)))
     arr = (INPUT * len(events))(*events)
     user32.SendInput(len(events), arr, ctypes.sizeof(INPUT))
+    return True
+
+
+# ---------------------------------------------------------------- keeping the text going to the right window
+user32.GetForegroundWindow.restype = wt.HWND
+user32.GetWindowThreadProcessId.argtypes = (wt.HWND, ctypes.POINTER(wt.DWORD))
+user32.SetForegroundWindow.argtypes = (wt.HWND,)
+user32.IsWindow.argtypes = (wt.HWND,)
+user32.GetWindowTextW.argtypes = (wt.HWND, wt.LPWSTR, ctypes.c_int)
+
+
+def window_title(hwnd):
+    buf = ctypes.create_unicode_buffer(200)
+    user32.GetWindowTextW(hwnd, buf, 200)
+    return buf.value
+
+
+def refocus(hwnd):
+    """Give the keyboard back to the window you were dictating into (something, e.g. a system pop-up, took it).
+    Windows only lets the process that owns the foreground do this, so borrow its input queue for a moment."""
+    fg = user32.GetForegroundWindow()
+    if not hwnd or fg == hwnd or not user32.IsWindow(hwnd):
+        return fg == hwnd
+    me = kernel32.GetCurrentThreadId()
+    theirs = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+    if theirs and theirs != me:
+        user32.AttachThreadInput(me, theirs, True)
+    try:
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        if theirs and theirs != me:
+            user32.AttachThreadInput(me, theirs, False)
+    time.sleep(0.05)
+    return user32.GetForegroundWindow() == hwnd
+
+
+def copy_to_clipboard(text):
+    """Fallback only (when the target window is gone): normally the clipboard is never touched."""
+    k = kernel32
+    k.GlobalAlloc.restype, k.GlobalLock.restype = ctypes.c_void_p, ctypes.c_void_p
+    k.GlobalLock.argtypes = k.GlobalUnlock.argtypes = (ctypes.c_void_p,)
+    user32.SetClipboardData.argtypes = (wt.UINT, ctypes.c_void_p)
+    data = (text + "\0").encode("utf-16-le")
+    for _ in range(10):                       # another app may hold the clipboard for a moment
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.05)
+    else:
+        return False
+    try:
+        user32.EmptyClipboard()
+        h = k.GlobalAlloc(0x2, len(data))     # GMEM_MOVEABLE
+        ctypes.memmove(k.GlobalLock(h), data, len(data))
+        k.GlobalUnlock(h)
+        return bool(user32.SetClipboardData(13, h))   # CF_UNICODETEXT
+    finally:
+        user32.CloseClipboard()
+
+
+class FILTERKEYS(ctypes.Structure):
+    _fields_ = [("cbSize", wt.UINT), ("dwFlags", wt.DWORD), ("iWaitMSec", wt.DWORD), ("iDelayMSec", wt.DWORD),
+                ("iRepeatMSec", wt.DWORD), ("iBounceMSec", wt.DWORD)]
+
+
+def disable_filter_keys_shortcut():
+    """Holding Shift ~8 s (a long dictation) triggers Windows' Filter Keys shortcut, whose pop-up steals the keyboard
+    focus so the text goes nowhere. Turn off only that shortcut (Filter Keys itself stays as you set it)."""
+    fk = FILTERKEYS(cbSize=ctypes.sizeof(FILTERKEYS))
+    if not user32.SystemParametersInfoW(0x32, fk.cbSize, ctypes.byref(fk), 0):   # SPI_GETFILTERKEYS
+        return
+    FKF_HOTKEYACTIVE = 0x4
+    if fk.dwFlags & FKF_HOTKEYACTIVE:
+        fk.dwFlags &= ~FKF_HOTKEYACTIVE
+        user32.SystemParametersInfoW(0x33, fk.cbSize, ctypes.byref(fk), 0x3)       # SET, save + broadcast
+        log.info("turned off the Windows Filter Keys shortcut (hold Shift 8 s): its pop-up steals focus mid-dictation")
 
 
 # ---------------------------------------------------------------- floating pill (never takes focus)
@@ -363,6 +444,12 @@ class Dictation:
         self.press_t = 0.0
         self.chord_dirty = False         # another key was pressed during the hold -> shortcut, not dictation
         self.events = queue.Queue()
+        self.target = None
+        if cfg.get("fix_filter_keys_shortcut", True):
+            try:
+                disable_filter_keys_shortcut()
+            except Exception:
+                log.exception("could not check the Filter Keys shortcut")
         self.beep = None
         if cfg.get("start_beep", True):
             self.beep = make_beep(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -418,6 +505,7 @@ class Dictation:
 
     def _begin(self):
         self.press_t = time.time()
+        self.target = user32.GetForegroundWindow()   # where the text should go, whatever pops up meanwhile
         self.mic.start()
         self.session = Session(self.engine, self.mic)
         threading.Timer(0.12, self._listening, args=(self.session,)).start()
@@ -448,7 +536,7 @@ class Dictation:
             self.pill.hide()
             return
         self.pill.show("Transcribing", "#a1a1aa")
-        threading.Thread(target=self._finish, args=(s, blocks, audio_s), daemon=True).start()
+        threading.Thread(target=self._finish, args=(s, blocks, audio_s, self.target), daemon=True).start()
 
     def simulate(self, audio, tail_silence_s=0.15, opts=None):
         """Test hook: play 16 kHz audio (+ the pause people leave before releasing) into a session in real time."""
@@ -468,15 +556,20 @@ class Dictation:
         return {"text": final, "asr_text": asr_text, "release_to_text_ms": int((time.time() - t_release) * 1000),
                 "speculation_hit": hit, "chunks": len(sess.chunks), "diag": sess.diag}
 
-    def _finish(self, s, blocks, audio_s):
+    def _finish(self, s, blocks, audio_s, target=None):
         t_release = time.time()
         try:
             res = s.finish(blocks)
             if res is None:
                 return
             asr_text, final, speech_s, wait_ms, hit = res
-            if final:
-                type_text(final + " ")
+            if final and not type_text(final + " ", target):
+                copied = copy_to_clipboard(final + " ")
+                log.warning("could not get back to %r: text %s", window_title(target)[:60],
+                            "copied to the clipboard" if copied else "lost (clipboard busy)")
+                if copied:
+                    self.pill.show("Copied - press Ctrl+V", "#f59e0b")
+                    time.sleep(4)
             total = (time.time() - t_release) * 1000
             self.engine.log_dictation(asr_text, final, speech_s, audio_s, wait_ms, total, "live",
                                       np.concatenate(blocks) if blocks else None)
