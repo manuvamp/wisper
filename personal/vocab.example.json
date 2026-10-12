@@ -1,0 +1,17 @@
+{
+  "_doc": "Copy to vocab.json and make it yours. names: spelled exactly like this everywhere (case is fixed automatically, so only list words that are never ordinary English). context: hints for the speech model only, never force-cased. The nightly learner appends to context.",
+  "names": [
+    "GitHub",
+    "ChatGPT",
+    "OpenAI",
+    "TestFlight",
+    "RevenueCat",
+    "LinkedIn",
+    "TikTok",
+    "YouTube"
+  ],
+  "context": [
+    "subagent",
+    "repo"
+  ]
+}

@@ -1,0 +1,9 @@
+faster-whisper>=1.2.1
+ctranslate2>=4.6
+numpy
+sounddevice>=0.5
+rapidfuzz>=3.0
+wordfreq>=3.1
+tokenizers
+av
+pywin32

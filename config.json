@@ -1,0 +1,16 @@
+{
+ "host": "127.0.0.1",
+ "port": 47821,
+ "asr_model": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+ "asr_compute_type": "float16",
+ "asr_beam_size": 1,
+ "language": "en",
+ "log_db": "data/wisper.db",
+ "native_hotkey": true,
+ "mic_idle_close_s": 600,
+ "start_beep": true,
+ "vocab_graph": "",
+ "vocab_folders": [
+  "~/.claude/skills/*"
+ ]
+}
