@@ -5,7 +5,7 @@
   -> code-only cleanup (cleanup.py: hesitations, stutters, filler asides, your mishearings, names, punctuation)
 Every dictation is logged to SQLite (+ an Opus clip) for the nightly learner (learn/learn.py).
 """
-import io, json, os, sqlite3, sys, threading, time, logging
+import io, json, os, re, sqlite3, sys, threading, time, logging
 from email.parser import BytesParser
 from email.policy import HTTP
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -36,6 +36,16 @@ import numpy as np  # noqa: E402
 from cleanup import Personal, clean, looks_like_hallucination  # noqa: E402
 
 
+def voiced_seconds(audio, block=800):
+    """Seconds of clearly-above-background sound (50 ms blocks louder than 3x this clip's own noise floor)."""
+    n = len(audio) // block
+    if n < 4:
+        return 0.0
+    lv = np.sqrt(np.mean(audio[:n * block].reshape(n, block) ** 2, axis=1))
+    floor = max(float(np.percentile(lv, 10)), 0.0005)
+    return float(np.sum(lv > max(0.003, 3 * floor))) * block / 16000
+
+
 class Engine:
     def __init__(self):
         self.personal = Personal()
@@ -51,6 +61,8 @@ class Engine:
             asr_text text, rules_text text, final_text text, llm_used int, llm_rejected int, llm_text text,
             source text default 'live', audio_file text)""")
         self.db.commit()
+        import ctranslate2
+        self._tiny = ctranslate2.StorageView.from_array(np.zeros((1, 128, 200), "float32"))
         self.asr(np.zeros(16000, "float32"), warm=True)
 
     def asr(self, audio, warm=False, prefix=None):
@@ -63,7 +75,8 @@ class Engine:
             return {"text": "", "speech_s": 0.0, "ms": 0}
         prompt = self.personal.asr_prompt_short + " " + prefix.strip() if prefix else self.personal.asr_prompt
         opts = dict(language=CFG["language"], beam_size=CFG["asr_beam_size"], initial_prompt=prompt,
-                    without_timestamps=True, no_speech_threshold=0.6, log_prob_threshold=-1.0)
+                    without_timestamps=True, no_speech_threshold=0.6, log_prob_threshold=-1.0,
+                    temperature=0.0)  # no slow re-decodes when unsure: 1 in 159 clips, +1.1 s, same words
         with self.gpu:
             if audio_s > 28:  # long audio: VAD-split pieces decoded as one GPU batch
                 segs, info = self.batched.transcribe(audio, batch_size=8, vad_filter=True, **opts)
@@ -72,12 +85,30 @@ class Engine:
                     audio, vad_filter=not warm, vad_parameters={"min_silence_duration_ms": 500, "speech_pad_ms": 300},
                     condition_on_previous_text=False, **opts)
             segs = [s for s in segs if not (s.no_speech_prob > 0.6 and s.avg_logprob < -1.0)]
-        text = " ".join(s.text.strip() for s in segs).strip()
-        speech_s = getattr(info, "duration_after_vad", audio_s) or 0.0
+            text = " ".join(s.text.strip() for s in segs).strip()
+            speech_s = getattr(info, "duration_after_vad", audio_s) or 0.0
+            sound_s = 0.0 if text or warm or audio_s > 28 else voiced_seconds(audio)
+            if sound_s >= 0.3:
+                # voice detection heard nothing, but the mic clearly did: short or soft dictations ("Do more.")
+                # fall below its threshold. Let Whisper itself listen; the noise guard below still drops junk.
+                segs, _ = self.model.transcribe(audio, vad_filter=False, condition_on_previous_text=False, **opts)
+                segs = [s for s in segs if not (s.no_speech_prob > 0.6 and s.avg_logprob < -1.0)
+                        and s.compression_ratio < 2.4 and re.search(r"[A-Za-z]", s.text)]   # ". . . ." from a breath
+                text, speech_s = " ".join(s.text.strip() for s in segs).strip(), sound_s
+                log.info("voice detection missed %.1fs of sound; without it: %r", sound_s, text[:80])
         if not warm and looks_like_hallucination(text, speech_s):
             log.info("dropped as noise/hallucination: %r", text[:120])
             text = ""
         return {"text": text, "speech_s": speech_s, "ms": (time.perf_counter() - t0) * 1000}
+
+    def wake_gpu(self):
+        """A ~20 ms job that brings the GPU out of its idle clock while you talk, so the real pass isn't run cold
+        (after ~15 s idle a pass took up to 2x longer). Skipped if a real pass is using the GPU."""
+        if self.gpu.acquire(blocking=False):
+            try:
+                self.model.model.encode(self._tiny)
+            finally:
+                self.gpu.release()
 
     def clean_text(self, asr_text):
         t0 = time.perf_counter()
@@ -92,7 +123,7 @@ class Engine:
                 (round(audio_s, 2), round(speech_s, 2), int(asr_ms), int(total_ms), asr_text, final, final, source))
             self.db.commit()
             row_id = cur.lastrowid
-        if audio is not None and final:
+        if audio is not None and (final or audio_s >= 0.5):   # empty results too: they show what got missed
             threading.Thread(target=self._save_audio, args=(row_id, audio), daemon=True).start()
         log.info("%.1fs audio -> asr %dms total %dms (%s)", audio_s, asr_ms, total_ms, source)
 

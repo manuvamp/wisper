@@ -229,4 +229,4 @@ def looks_like_hallucination(text, speech_s):
 
 NON_LATIN = re.compile("[^\\x00-\\u024F\\u2000-\\u206F\\u20AC\\u2122\\s\\d]")
 PHANTOMS = {"thank you", "thanks for watching", "thank you for watching", "you", "bye", "music",
-            "applause", "subtitles by the amaraorg community", "please subscribe"}
+            "applause", "subtitles by the amaraorg community", "please subscribe", "closed captioning"}

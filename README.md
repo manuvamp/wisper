@@ -77,6 +77,15 @@ Memory: one process, ~0.6 GB RAM and ~2.6 GB of GPU memory.
   (`lab/chunk_test.py`, all switchable per session): no measurable gain over the defaults, and 3 s chunks alone
   changed more words.
 
+## Short and soft dictations
+- Voice detection (Silero VAD) skips audio it doesn't think is speech, which can swallow a soft "Do more." If it
+  finds nothing but the mic clearly picked up sound, Whisper listens to the whole clip itself; output that is only
+  punctuation, repetitive, or a classic phantom ("Thank you." from silence) is still dropped.
+- No temperature re-decodes: Whisper's "retry when unsure" fired on 1 of 159 clips, cost +1.1 s and changed nothing.
+- The GPU is woken (a ~20 ms job) when you press the hotkey and kept awake while you hold it: after ~15 s idle a pass
+  otherwise ran up to 2x slower.
+- Empty results keep their audio too (`data/audio`), so misses can be checked later.
+
 ## Text always lands
 - Holding Shift for ~8 s triggers Windows' Filter Keys shortcut, whose pop-up steals the keyboard focus. wisper turns
   that shortcut off at start (`"fix_filter_keys_shortcut": false` to leave it alone); Filter Keys itself is untouched.
