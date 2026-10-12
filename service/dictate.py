@@ -509,6 +509,16 @@ class Dictation:
         self.mic.start()
         self.session = Session(self.engine, self.mic)
         threading.Timer(0.12, self._listening, args=(self.session,)).start()
+        threading.Thread(target=self._keep_gpu_awake, args=(self.session,), daemon=True).start()
+
+    def _keep_gpu_awake(self, s):
+        """While you hold the keys, keep the GPU clocked up so the pass after release isn't run cold."""
+        while self.session is s and not s.cancelled:
+            try:
+                self.engine.wake_gpu()
+            except Exception:
+                return
+            time.sleep(1.5)
 
     def _listening(self, s):
         """Shown/played only once the hold is clearly dictation, not a Ctrl+Shift+<key> shortcut."""
