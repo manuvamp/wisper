@@ -76,12 +76,13 @@ changes (PC restarted) or the PC gets a new Wi-Fi address, the phone finds it ag
 New token (unpairs every phone): delete <code>data/remote-token.txt</code> and restart wisper.</p>"""
     apk = sys.argv[sys.argv.index("--apk") + 1] if "--apk" in sys.argv else None
     if apk:
-        url = f"http://{addrs[0][1]}:47824/wisper-keys.apk"
+        url = apk if apk.startswith("https://") else f"http://{addrs[0][1]}:47824/wisper-keys.apk"
         apk_svg = segno.make(url, error="m").svg_inline(scale=6, dark="#f4f4f5", light="#18181b")
         page = page.replace("<h1>Pair a phone with wisper</h1>", f"""<h1>Pair a phone with wisper</h1>
 <h3>1. Android: install the app</h3><p>Scan with the phone camera, download, open the file and allow the install
 (Android asks once to allow installs from your browser).</p><div class="qr">{apk_svg}</div>
-<p class="dim"><code>{html.escape(url)}</code> (available for 15 minutes)</p><h3>2. Pair</h3>""")
+<p class="dim"><code>{html.escape(url)}</code>{"" if apk.startswith("https://") else " (available for 15 minutes)"}</p>
+<h3>2. Pair</h3>""")
     path = os.path.join(ROOT, "data", "pair.html")
     open(path, "w", encoding="utf-8").write(page)
     print("pairing link:", link)
@@ -90,7 +91,7 @@ New token (unpairs every phone): delete <code>data/remote-token.txt</code> and r
     print("token:", token)
     if "--no-open" not in sys.argv:
         webbrowser.open("file:///" + path.replace("\\", "/"))
-    if apk:
+    if apk and not apk.startswith("https://"):
         serve_apk(apk)
 
 
