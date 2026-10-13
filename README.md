@@ -78,6 +78,14 @@ serves the OpenAI-compatible API on :47823 with the token as API key. Every conn
 - `python -I tools\pair.py`: QR code for the phone (Wi-Fi address, plus Tailscale if installed).
 - `powershell -File tools\allow_phone_access.ps1`: firewall rule for home Wi-Fi and Tailscale only (admin, once).
 - Phone dictations are logged with source `phone` and the nightly learner uses them too.
+- **Pair once, works anywhere.** Home Wi-Fi: direct, and wisper announces itself over mDNS (`_wisper._tcp`, with
+  only a fingerprint of the token) so the phone finds it again when the PC's address changes. Mobile data / other
+  Wi-Fi: wisper runs a Cloudflare quick tunnel (`bin/cloudflared.exe`, no account; download
+  `cloudflared-windows-amd64.exe` from Cloudflare's GitHub releases) and publishes its current `wss://` address
+  to a secret gist (via `gh`, id in `data/remote-gist.txt`) that the phone reads when the old address stops
+  answering. The token is still required on every connection. `"remote_tunnel": false` turns this off.
+- Light: the tunnel is one ~45 MB process with no CPU use when idle, tied to wisper by a job object (it never
+  outlives it); mDNS rechecks the address once a minute.
 
 ## Things that were tested and rejected
 - An LLM cleanup pass (Qwen 3.5 4B): ~0.8 GB more memory and ~0.9 s per use, and it mostly changed punctuation.
