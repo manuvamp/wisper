@@ -234,6 +234,9 @@ def main():
     if CFG.get("native_hotkey", True):
         from dictate import Dictation
         DICTATION = Dictation(ENGINE, CFG)
+    if CFG.get("remote"):   # phone keyboards over Wi-Fi/Tailscale (remote.py)
+        from remote import start_remote
+        start_remote(ENGINE, CFG, Handler)
     log.info("wisper listening on http://%s:%d/v1", CFG["host"], CFG["port"])
     srv.serve_forever()
 

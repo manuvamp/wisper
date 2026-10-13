@@ -69,6 +69,16 @@ Memory: one process, ~0.6 GB RAM and ~2.6 GB of GPU memory.
 - Any app that speaks the OpenAI transcription API can use `http://127.0.0.1:47821/v1/audio/transcriptions`.
 - `"start_beep": false` in the config turns the beep off.
 
+## Phone keyboard (wisper keys)
+`"remote": true` (in `config.local.json`) lets the wisper-keys Android/iOS keyboard
+(`D:\hackathn fire tv\wisper-keys`) dictate through this PC. `service/remote.py` streams the phone's mic into the same
+Session as Ctrl+Shift (ws on :47822), so release -> text is as fast as on the PC plus the Wi-Fi round trip; it also
+serves the OpenAI-compatible API on :47823 with the token as API key. Every connection needs the token in
+`data/remote-token.txt` (delete it and restart for a new one).
+- `python -I tools\pair.py`: QR code for the phone (Wi-Fi address, plus Tailscale if installed).
+- `powershell -File tools\allow_phone_access.ps1`: firewall rule for home Wi-Fi and Tailscale only (admin, once).
+- Phone dictations are logged with source `phone` and the nightly learner uses them too.
+
 ## Things that were tested and rejected
 - An LLM cleanup pass (Qwen 3.5 4B): ~0.8 GB more memory and ~0.9 s per use, and it mostly changed punctuation.
 - Shorter encoder windows: 2x faster passes, but 27-53% of words garbled. Whisper needs its full 30 s window.

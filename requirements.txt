@@ -7,3 +7,5 @@ wordfreq>=3.1
 tokenizers
 av
 pywin32
+websockets>=13
+segno

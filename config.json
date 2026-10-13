@@ -12,5 +12,9 @@
  "vocab_graph": "",
  "vocab_folders": [
   "~/.claude/skills/*"
- ]
+ ],
+ "remote": false,
+ "remote_host": "0.0.0.0",
+ "remote_port": 47822,
+ "remote_http_port": 47823
 }
