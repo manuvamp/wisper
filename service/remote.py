@@ -32,7 +32,46 @@ from dictate import BLOCK, SR, Session
 log = logging.getLogger("wisper")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOKEN_FILE = os.path.join(ROOT, "data", "remote-token.txt")
+GIST_FILE = os.path.join(ROOT, "data", "remote-gist.txt")
+TUNNEL_FILE = os.path.join(ROOT, "data", "remote-tunnel.json")    # current public address, for tools/pair.py
+CLOUDFLARED = os.path.join(ROOT, "bin", "cloudflared.exe")
 MIN_AUDIO_S = 0.3
+
+
+def _kill_with_me_job():
+    """A Windows job that kills its processes when wisper exits (crash, restart, logoff): no orphaned tunnels."""
+    try:
+        import win32job
+        job = win32job.CreateJobObject(None, "")
+        info = win32job.QueryInformationJobObject(job, win32job.JobObjectExtendedLimitInformation)
+        info["BasicLimitInformation"]["LimitFlags"] |= win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        win32job.SetInformationJobObject(job, win32job.JobObjectExtendedLimitInformation, info)
+        return job
+    except Exception:
+        log.exception("no job object; the tunnel may outlive wisper")
+        return None
+
+
+def _kill_stale(exe):
+    """A tunnel left over from an older wisper (only this exact program; other apps' cloudflared are untouched)."""
+    try:
+        import win32api, win32con, win32process
+        for pid in win32process.EnumProcesses():
+            try:
+                h = win32api.OpenProcess(win32con.PROCESS_QUERY_INFORMATION | win32con.PROCESS_VM_READ
+                                         | win32con.PROCESS_TERMINATE, False, pid)
+            except Exception:
+                continue
+            try:
+                if os.path.normcase(win32process.GetModuleFileNameEx(h, None)) == os.path.normcase(exe):
+                    win32api.TerminateProcess(h, 1)
+                    log.info("stopped a leftover tunnel (pid %d)", pid)
+            except Exception:
+                pass
+            finally:
+                win32api.CloseHandle(h)
+    except Exception:
+        log.exception("could not check for a leftover tunnel")
 
 
 def remote_token(cfg):
@@ -146,6 +185,7 @@ class Remote:
     def __init__(self, engine, cfg, http_handler):
         self.engine, self.cfg = engine, cfg
         self.token = remote_token(cfg)
+        self.tunnel_url = None
         host = cfg.get("remote_host", "0.0.0.0")
         ws_port, http_port = cfg.get("remote_port", 47822), cfg.get("remote_http_port", 47823)
         self.ws = serve(self._handle, host, ws_port, process_request=self._check, compression=None,
@@ -156,6 +196,124 @@ class Remote:
             threading.Thread(target=self.http.serve_forever, daemon=True, name="remote-http").start()
         log.info("phone access on %s: ws :%d/v1/stream, http :%s/v1 (run tools/pair.py to pair a phone)",
                  host, ws_port, http_port or "-")
+        threading.Thread(target=self._announce, args=(ws_port, http_port), daemon=True, name="remote-mdns").start()
+        if cfg.get("remote_tunnel", True) and os.path.exists(CLOUDFLARED):
+            threading.Thread(target=self._tunnel, args=(ws_port,), daemon=True, name="remote-tunnel").start()
+
+    # ---------------------------------------------------------------- away from home
+    def _tunnel(self, ws_port):
+        """Reach the PC from anywhere (mobile data, other Wi-Fi) with no app on the phone: a Cloudflare quick tunnel
+        (no account) gives a public wss:// address with a real certificate; every connection still needs the token.
+        The address is new each time the tunnel starts, so it is published to a secret GitHub gist (via the gh CLI
+        you're signed in to) that the phone reads when its saved addresses stop answering. Light: one ~45 MB
+        process, idle unless you dictate; it dies with wisper (job object), never orphaned."""
+        import subprocess
+        job = _kill_with_me_job()
+        _kill_stale(CLOUDFLARED)
+        delay = 5
+        while True:
+            t0 = time.time()
+            try:
+                p = subprocess.Popen([CLOUDFLARED, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{ws_port}"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                     creationflags=subprocess.CREATE_NO_WINDOW, text=True, encoding="utf-8", errors="replace")
+                if job:
+                    import win32api, win32con, win32job
+                    h = win32api.OpenProcess(win32con.PROCESS_SET_QUOTA | win32con.PROCESS_TERMINATE, False, p.pid)
+                    win32job.AssignProcessToJobObject(job, h)
+                for line in p.stderr:                 # keep reading: a full pipe would stall it
+                    m = re.search(r"https://([a-z0-9-]+\.trycloudflare\.com)", line)
+                    if m and not self.tunnel_url:
+                        self.tunnel_url = "wss://" + m.group(1)
+                        log.info("reachable from anywhere at %s", self.tunnel_url)
+                        threading.Thread(target=self._publish, daemon=True).start()
+                p.wait()
+            except Exception:
+                log.exception("tunnel failed")
+            self.tunnel_url = None
+            delay = 5 if time.time() - t0 > 300 else min(delay * 2, 300)
+            log.warning("tunnel stopped; restarting in %ds", delay)
+            time.sleep(delay)
+
+    def _publish(self):
+        """Write the current addresses to the gist (made on first use; its id is in data/remote-gist.txt)."""
+        import hashlib, shutil, subprocess
+        gh = shutil.which("gh") or r"C:\Program Files\GitHub CLI\gh.exe"
+        url = self.tunnel_url
+        body = json.dumps({"id": hashlib.sha256(self.token.encode()).hexdigest()[:12], "urls": [url],
+                           "pc": socket.gethostname(), "updated": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+        run = dict(capture_output=True, text=True, timeout=60, creationflags=subprocess.CREATE_NO_WINDOW)
+        for attempt in range(30):                     # offline right after boot: keep trying for ~30 min
+            if url != self.tunnel_url:
+                return                                # a newer tunnel took over
+            try:
+                gid = open(GIST_FILE).read().strip() if os.path.exists(GIST_FILE) else ""
+                if not gid:
+                    r = subprocess.run([gh, "gist", "create", "--filename", "wisper.json", "-d",
+                                        "wisper: where the phone keyboard finds this PC", "-"], input=body, **run)
+                    gid = r.stdout.strip().rstrip("/").rsplit("/", 1)[-1] if r.returncode == 0 else ""
+                    if gid:
+                        open(GIST_FILE, "w").write(gid)
+                else:
+                    r = subprocess.run([gh, "api", "-X", "PATCH", f"gists/{gid}", "--input", "-"],
+                                       input=json.dumps({"files": {"wisper.json": {"content": body}}}), **run)
+                if gid and r.returncode == 0:
+                    json.dump({"url": url, "rendezvous": f"https://api.github.com/gists/{gid}"},
+                              open(TUNNEL_FILE, "w"))
+                    return log.info("published the address for the phone (gist %s)", gid)
+                log.warning("could not publish the address: %s", (r.stderr or r.stdout).strip()[:200])
+            except Exception as e:
+                log.warning("could not publish the address: %s", e)
+            time.sleep(60)
+
+    def _announce(self, ws_port, http_port):
+        """Tell phones on the network where this PC is (mDNS/Bonjour, _wisper._tcp), so pairing is once: when the
+        PC gets a new Wi-Fi address after a restart, the phone finds it again. The service only carries a
+        fingerprint of the token ("id") so the phone can tell its own PC apart; the token itself never goes out."""
+        try:
+            from zeroconf import ServiceInfo, Zeroconf
+        except ImportError:
+            return log.warning("zeroconf not installed: phones can't find this PC if its address changes")
+        import hashlib, ipaddress
+        fid = hashlib.sha256(self.token.encode()).hexdigest()[:12]
+        name = re.sub(r"[^A-Za-z0-9-]", "-", socket.gethostname())
+
+        def addrs():
+            """The Wi-Fi/LAN address (the one with the default route; not WSL/VPN adapters) + Tailscale."""
+            out = set()
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("10.255.255.255", 1))           # no packet is sent; just picks the interface
+                out.add(ipaddress.ip_address(s.getsockname()[0]).packed)
+                s.close()
+            except OSError:
+                pass
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                ip = ipaddress.ip_address(info[4][0])
+                if ip in ipaddress.ip_network("100.64.0.0/10"):
+                    out.add(ip.packed)
+            return sorted(out)
+
+        zc, info, last = None, None, None
+        while True:
+            try:
+                cur = addrs()
+                if cur != last:          # first start, or the PC's addresses changed (new network, Wi-Fi back)
+                    if zc is None:
+                        zc = Zeroconf()
+                    if info is not None:
+                        zc.unregister_service(info)
+                    info = ServiceInfo("_wisper._tcp.local.", f"{name}._wisper._tcp.local.", port=ws_port,
+                                       addresses=cur, server=f"{name}.local.",
+                                       properties={"id": fid, "pc": socket.gethostname(), "http": str(http_port or "")})
+                    zc.register_service(info)
+                    log.info("announced on the network as %s (%s)", name,
+                             ", ".join(str(ipaddress.ip_address(a)) for a in cur))
+                    last = cur
+            except Exception:
+                log.exception("mDNS announce failed (will retry)")
+                last = None
+            time.sleep(60)
 
     def ok(self, supplied):
         return bool(supplied) and hmac.compare_digest(supplied.encode(), self.token.encode())

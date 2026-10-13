@@ -9,3 +9,4 @@ av
 pywin32
 websockets>=13
 segno
+zeroconf
